@@ -1,0 +1,113 @@
+# app.py
+import pathlib
+import pandas as pd
+import numpy as np
+import streamlit as st
+import plotly.express as px
+
+st.set_page_config(page_title="Crypto Explorer", layout="wide")
+
+st.title("Cryptocurrency Market Explorer")
+
+data_dir = st.sidebar.text_input("Data folder (CSV files, one per currency)", "data")
+roll_win = st.sidebar.number_input("Rolling Vol Window (days)", 30, 200, 30)
+top_n = st.sidebar.number_input("Top N by Latest Market Cap", 1, 50, 5)
+show_log = st.sidebar.checkbox("Show Log Prices", False)
+
+@st.cache_data(show_spinner=False)
+def load_data(folder: str):
+    p = pathlib.Path(folder)
+    frames = []
+    if not p.exists():
+        return pd.DataFrame()
+    for csv in p.glob("*.csv"):
+        df = pd.read_csv(csv)
+        if "Date" not in df.columns:
+            continue
+        df["Currency"] = csv.stem
+        df.columns = [c.strip().replace(" ", "_") for c in df.columns]
+        df["Date"] = pd.to_datetime(df["Date"])
+        for col in ["Market_Cap","Volume","Open","High","Low","Close"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        frames.append(df)
+    if not frames:
+        return pd.DataFrame()
+    data = (pd.concat(frames, ignore_index=True)
+              .sort_values(["Currency","Date"]))
+    data[["Market_Cap","Volume"]] = data.groupby("Currency")[["Market_Cap","Volume"]].ffill()
+    data["Return"] = data.groupby("Currency")["Close"].pct_change()
+    data["RollingVol"] = (data.groupby("Currency")["Return"]
+                          .rolling(roll_win).std()
+                          .reset_index(level=0, drop=True))
+    data["LogPrice"] = np.log(data["Close"])
+    return data
+
+data = load_data(data_dir)
+
+if data.empty:
+    st.info("No data loaded. Adjust folder path.")
+    st.stop()
+
+# Summary
+summary = (data.groupby("Currency")
+           .agg(Latest_MarketCap=("Market_Cap","last"),
+                Latest_Close=("Close","last"),
+                Avg_Return=("Return","mean"),
+                Volatility_Mean=("RollingVol","mean"),
+                First_Date=("Date","min"),
+                Last_Date=("Date","max"),
+                Days=("Date","nunique"))
+           .sort_values("Latest_MarketCap", ascending=False))
+
+st.subheader("Summary")
+st.dataframe(summary.style.format({"Latest_MarketCap":"{:.0f}",
+                                   "Latest_Close":"{:.2f}",
+                                   "Avg_Return":"{:.5f}",
+                                   "Volatility_Mean":"{:.5f}"}),
+             use_container_width=True)
+
+top_currencies = summary.head(top_n).index.tolist()
+
+# Price chart
+st.subheader("Price Chart")
+price_col = "LogPrice" if show_log else "Close"
+price_df = data[data["Currency"].isin(top_currencies)]
+fig_price = px.line(price_df, x="Date", y=price_col, color="Currency",
+                    title=f"{'Log ' if show_log else ''}Prices (Top {top_n})")
+st.plotly_chart(fig_price, use_container_width=True)
+
+# Rolling Volatility
+st.subheader("Rolling Volatility")
+vol_df = price_df.dropna(subset=["RollingVol"])
+fig_vol = px.line(vol_df, x="Date", y="RollingVol", color="Currency",
+                  title=f"{roll_win}-Day Rolling Volatility")
+st.plotly_chart(fig_vol, use_container_width=True)
+
+# Correlation matrix
+st.subheader("Return Correlation (Top N)")
+wide_returns = (data[data["Currency"].isin(top_currencies)]
+                .pivot(index="Date", columns="Currency", values="Return"))
+corr = wide_returns.corr()
+st.dataframe(corr.style.background_gradient(cmap="RdBu_r", vmin=-1, vmax=1),
+             use_container_width=True)
+
+# Single currency drill-down
+st.subheader("Single Currency Drill-Down")
+sel = st.selectbox("Currency", sorted(data["Currency"].unique()))
+single = data[data["Currency"] == sel]
+
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("Latest Close", f"{single['Close'].iloc[-1]:.2f}")
+col2.metric("Latest Market Cap", f"{single['Market_Cap'].iloc[-1]:,.0f}")
+col3.metric("Mean Return", f"{single['Return'].mean():.5f}")
+col4.metric(f"{roll_win}d Vol (last)", f"{single['RollingVol'].iloc[-1]:.5f}")
+
+fig_single = px.line(single, x="Date", y="Close", title=f"{sel} Close Price")
+st.plotly_chart(fig_single, use_container_width=True)
+
+# Download summary
+st.download_button("Download Summary CSV",
+                   data=summary.to_csv().encode(),
+                   file_name="crypto_summary.csv",
+                   mime="text/csv")
